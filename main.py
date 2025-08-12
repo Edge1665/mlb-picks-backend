@@ -100,16 +100,91 @@ except Exception as e:
     MISSING_MODEL_ARTIFACTS = True
     IMPORT_ERROR_DETAIL = str(e)
 
+# --- MLB StatsAPI lineup fetch (real) ---
+# We use: 
+#   Schedule: https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=YYYY-MM-DD
+#   Boxscore: https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore
+# We extract batting orders (1–9) only; if no lineup yet, we skip that game.
+
+async def _get_game_pks_for_date(client: httpx.AsyncClient, date_str: str) -> List[int]:
+    url = "https://statsapi.mlb.com/api/v1/schedule"
+    params = {"sportId": 1, "date": date_str}
+    r = await client.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    pks: List[int] = []
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
+            # filter only regular/official games
+            if g.get("status", {}).get("codedGameState") in {"P", "S", "I", "F", "O", "D", "U", "C"}:
+                pks.append(g.get("gamePk"))
+            else:
+                pks.append(g.get("gamePk"))
+    return [pk for pk in pks if pk]
+
+def _extract_lineup_from_boxscore_json(js: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for side in ("home", "away"):
+        team_name = js.get("teams", {}).get(side, {}).get("team", {}).get("name", "")
+        players = js.get("teams", {}).get(side, {}).get("players", {}) or {}
+        for key, pl in players.items():
+            # battingOrder is like "101","102",..., "901"; convert to 1..9
+            bo = pl.get("battingOrder")
+            if not bo:
+                continue
+            try:
+                lineup_spot = int(bo) // 100
+                if lineup_spot < 1 or lineup_spot > 9:
+                    continue
+            except Exception:
+                continue
+            person = pl.get("person", {})
+            pid = person.get("id")
+            name = person.get("fullName") or person.get("boxscoreName") or "Unknown"
+            if not pid:
+                continue
+            out.append({
+                "playerId": int(pid),
+                "playerName": str(name),
+                "team": team_name,
+                "lineupSpot": lineup_spot
+            })
+    # dedupe by playerId (some double-entries can appear)
+    seen = set()
+    dedup: List[Dict[str, Any]] = []
+    for r in out:
+        if r["playerId"] in seen:
+            continue
+        seen.add(r["playerId"])
+        dedup.append(r)
+    return dedup
+
+async def _fetch_boxscore(client: httpx.AsyncClient, game_pk: int) -> List[Dict[str, Any]]:
+    url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+    r = await client.get(url, timeout=20)
+    if r.status_code != 200:
+        return []
+    try:
+        return _extract_lineup_from_boxscore_json(r.json())
+    except Exception:
+        return []
+
 async def fetch_lineups_for_today(date_str: Optional[str] = None) -> List[Dict[str, Any]]:
-    """MVP: placeholder lineup list. Replace with a real lineup source later."""
     if not date_str:
         date_str = dt.date.today().isoformat()
-    # A few well-known players as a smoke test; you can expand later.
-    return [
-        {"playerId": 660271, "playerName": "Aaron Judge", "team": "Yankees", "lineupSpot": 2},
-        {"playerId": 592450, "playerName": "Mike Trout", "team": "Angels", "lineupSpot": 2},
-        {"playerId": 592626, "playerName": "Bryce Harper", "team": "Phillies", "lineupSpot": 3},
-    ]
+    async with httpx.AsyncClient() as client:
+        game_pks = await _get_game_pks_for_date(client, date_str)
+        # fetch boxscores concurrently
+        tasks = [asyncio.create_task(_fetch_boxscore(client, pk)) for pk in game_pks]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    players: List[Dict[str, Any]] = []
+    for res in results:
+        if isinstance(res, Exception):
+            continue
+        players.extend(res)
+    # If no lineups are posted yet (early morning), you could fallback here to rosters.
+    return players
+
 
 async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, Any]]:
     """Build the JSON payload for /markets and websocket broadcast."""
