@@ -1,4 +1,4 @@
-# main.py — real lineups + recent rates + optional sportsbook odds + scoring
+# main.py — lineups + roster fallback + recent rates + sportsbook odds + edge + scores
 from __future__ import annotations
 
 import os
@@ -11,16 +11,17 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Load your model feature builder (pandas-free version recommended)
+# ---------------- Model feature builder ----------------
 MISSING_MODEL_ARTIFACTS = False
 IMPORT_ERROR_DETAIL = ""
 try:
-    from feature_builder import build_today_features  # expects list[dict] -> list[dict]
+    # robust builder should be: build_today_features(date_str: str, players: list[dict]) -> list[dict]
+    from feature_builder import build_today_features
 except Exception as e:
     MISSING_MODEL_ARTIFACTS = True
     IMPORT_ERROR_DETAIL = str(e)
 
-# -------- App & CORS --------
+# ---------------- App & CORS ----------------
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 app = FastAPI(title="MLB Picks API")
 app.add_middleware(
@@ -31,13 +32,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ========= Helpers: MLB schedule/lineups (no roster fallback) =========
-# --- MLB StatsAPI lineup fetch (with roster fallback) ---
-# Endpoints:
-#   Schedule:  https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=YYYY-MM-DD
-#   Boxscore:  https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore
-#   Roster:    https://statsapi.mlb.com/api/v1/teams/{teamId}/roster?rosterType=active
-
+# ================= MLB API helpers =================
 async def _get_game_pks_for_date(client: httpx.AsyncClient, date_str: str) -> List[int]:
     url = "https://statsapi.mlb.com/api/v1/schedule"
     params = {"sportId": 1, "date": date_str}
@@ -53,6 +48,7 @@ async def _get_game_pks_for_date(client: httpx.AsyncClient, date_str: str) -> Li
     return pks
 
 def _extract_lineup_from_boxscore_json(js: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Parse a boxscore for batting orders (1–9)."""
     out: List[Dict[str, Any]] = []
     for side in ("home", "away"):
         team_name = js.get("teams", {}).get(side, {}).get("team", {}).get("name", "")
@@ -76,100 +72,126 @@ def _extract_lineup_from_boxscore_json(js: Dict[str, Any]) -> List[Dict[str, Any
                 "playerId": int(pid),
                 "playerName": str(name),
                 "team": team_name,
-                "lineupSpot": lineup_spot
+                "lineupSpot": lineup_spot,
             })
     # dedupe
-    seen = set(); dedup: List[Dict[str, Any]] = []
+    seen = set()
+    dedup: List[Dict[str, Any]] = []
     for r in out:
-        if r["playerId"] in seen: continue
-        seen.add(r["playerId"]); dedup.append(r)
+        if r["playerId"] in seen:
+            continue
+        seen.add(r["playerId"])
+        dedup.append(r)
     return dedup
 
-def _teams_from_boxscore(js: Dict[str, Any]) -> List[Dict[str, Any]]:
-    teams: List[Dict[str, Any]] = []
-    for side in ("home", "away"):
-        blk = js.get("teams", {}).get(side, {}) or {}
-        team = blk.get("team", {}) or {}
-        tid = team.get("id"); tname = team.get("name")
-        if tid and tname:
-            teams.append({"teamId": int(tid), "teamName": str(tname)})
-    return teams
-
-async def _fetch_active_roster(client: httpx.AsyncClient, team_id: int, team_name: str) -> List[Dict[str, Any]]:
-    url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster"
-    params = {"rosterType": "active"}
-    r = await client.get(url, params=params, timeout=20)
-    if r.status_code != 200:
-        return []
-    out: List[Dict[str, Any]] = []
-    try:
-        data = r.json()
-        for item in data.get("roster", []) or []:
-            person = item.get("person", {}) or {}
-            pid = person.get("id"); name = person.get("fullName") or "Unknown"
-            if not pid: continue
-            out.append({
-                "playerId": int(pid),
-                "playerName": str(name),
-                "team": team_name,
-                "lineupSpot": None  # unknown before lineups
-            })
-    except Exception:
-        return []
-    return out
-
-async def _fetch_boxscore_with_fallback(client: httpx.AsyncClient, game_pk: int) -> List[Dict[str, Any]]:
-    # Try posted lineups
+async def _fetch_boxscore_lineups(client: httpx.AsyncClient, game_pk: int) -> List[Dict[str, Any]]:
     url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
-    r = await client.get(url, timeout=20)
-    if r.status_code != 200:
-        return []
     try:
-        js = r.json()
+        r = await client.get(url, timeout=20)
+        if r.status_code != 200:
+            return []
+        return _extract_lineup_from_boxscore_json(r.json())
     except Exception:
         return []
 
-    lineup = _extract_lineup_from_boxscore_json(js)
-    if lineup:
-        return lineup
-
-    # Fallback to active rosters (before lineups post)
-    teams = _teams_from_boxscore(js)
-    if not teams:
+async def _fetch_team_roster(client: httpx.AsyncClient, team_id: int, team_name: str) -> List[Dict[str, Any]]:
+    """Roster fallback: active hitters (skip pitchers)."""
+    url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster/active"
+    try:
+        r = await client.get(url, timeout=15)
+        if r.status_code != 200:
+            return []
+        js = r.json()
+        out: List[Dict[str, Any]] = []
+        for item in js.get("roster", []) or []:
+            person = item.get("person", {}) or {}
+            pid = person.get("id")
+            name = person.get("fullName") or "Unknown"
+            pos = (item.get("position", {}) or {}).get("abbreviation", "")
+            # skip pitchers in fallback so the board isn't polluted
+            if pid and pos != "P":
+                out.append({
+                    "playerId": int(pid),
+                    "playerName": str(name),
+                    "team": team_name,
+                    "lineupSpot": None,  # unknown until lineups post
+                })
+        return out
+    except Exception:
         return []
-    res = await asyncio.gather(*(asyncio.create_task(_fetch_active_roster(client, t["teamId"], t["teamName"])) for t in teams), return_exceptions=True)
-    players: List[Dict[str, Any]] = []
-    for r in res:
-        if isinstance(r, Exception): continue
-        players.extend(r)
 
-    # dedupe
-    seen = set(); dedup: List[Dict[str, Any]] = []
-    for r in players:
-        if r["playerId"] in seen: continue
-        seen.add(r["playerId"]); dedup.append(r)
-    return dedup
-
-async def fetch_lineups_for_today(date_str: Optional[str] = None) -> List[Dict[str, Any]]:
+async def fetch_players_for_today(date_str: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Use posted lineups when available; otherwise fall back to active rosters for the teams playing today.
+    """
     if not date_str:
         date_str = dt.date.today().isoformat()
     async with httpx.AsyncClient() as client:
-        pks = await _get_game_pks_for_date(client, date_str)
-        if not pks: return []
-        res = await asyncio.gather(*(asyncio.create_task(_fetch_boxscore_with_fallback(client, pk)) for pk in pks), return_exceptions=True)
-    players: List[Dict[str, Any]] = []
-    for r in res:
-        if isinstance(r, Exception): continue
-        players.extend(r)
-    # final dedupe
-    seen = set(); dedup: List[Dict[str, Any]] = []
-    for r in players:
-        if r["playerId"] in seen: continue
-        seen.add(r["playerId"]); dedup.append(r)
-    return dedup
+        # which games today?
+        schedule_url = "https://statsapi.mlb.com/api/v1/schedule"
+        rs = await client.get(schedule_url, params={"sportId": 1, "date": date_str}, timeout=20)
+        rs.raise_for_status()
+        sched = rs.json()
+        game_pks: List[int] = []
+        teams_today: List[Tuple[int, str]] = []  # (team_id, team_name)
+        for d in sched.get("dates", []) or []:
+            for g in d.get("games", []) or []:
+                pk = g.get("gamePk")
+                if pk:
+                    game_pks.append(int(pk))
+                # collect team ids & names for roster fallback
+                for side in ("home", "away"):
+                    tinfo = g.get(f"{side}Team", {}) or {}
+                    tid = tinfo.get("id")
+                    tname = (tinfo.get("team", {}) or {}).get("name") or tinfo.get("name") or ""
+                    if tid:
+                        teams_today.append((int(tid), str(tname)))
+        # First, try to pull posted lineups via boxscore
+        if game_pks:
+            lineup_results = await asyncio.gather(
+                *(asyncio.create_task(_fetch_boxscore_lineups(client, pk)) for pk in game_pks),
+                return_exceptions=True
+            )
+            players: List[Dict[str, Any]] = []
+            for res in lineup_results:
+                if isinstance(res, Exception):
+                    continue
+                players.extend(res)
+            if players:
+                # dedupe
+                seen = set(); dedup: List[Dict[str, Any]] = []
+                for r in players:
+                    if r["playerId"] in seen: continue
+                    seen.add(r["playerId"]); dedup.append(r)
+                return dedup
 
-# ========= Helpers: last-30-day hitting rates (per player) =========
+        # Fallback: use active rosters for the teams playing today
+        # dedupe team list
+        team_map: Dict[int, str] = {}
+        for tid, tname in teams_today:
+            if tid not in team_map:
+                team_map[tid] = tname
+        roster_results = await asyncio.gather(
+            *(_fetch_team_roster(client, tid, team_map.get(tid, "")) for tid in team_map.keys()),
+            return_exceptions=True
+        )
+        players: List[Dict[str, Any]] = []
+        for res in roster_results:
+            if isinstance(res, Exception): continue
+            players.extend(res)
+        # final dedupe
+        seen = set(); dedup: List[Dict[str, Any]] = []
+        for r in players:
+            if r["playerId"] in seen: continue
+            seen.add(r["playerId"]); dedup.append(r)
+        return dedup
+
+# ================= Per-player last-30-day hitting rates =================
 async def fetch_recent_rates(players: List[dict], date_iso: str, window_days: int = 30) -> Dict[int, Dict[str, float | None]]:
+    """
+    For each playerId, fetch last-30-day PA/hits/HR and return:
+      { playerId: { 'pa': float, 'hr_rate': float|None, 'hit_rate': float|None } }
+    """
     end_dt = dt.date.fromisoformat(date_iso)
     start_dt = end_dt - dt.timedelta(days=window_days)
     start, end = start_dt.isoformat(), end_dt.isoformat()
@@ -203,14 +225,16 @@ async def fetch_recent_rates(players: List[dict], date_iso: str, window_days: in
     return out
 
 def apply_recent_rates(players: List[dict], rates: Dict[int, Dict[str, float | None]]) -> List[dict]:
-    enriched = []
+    """
+    Attach hr_rate_rolling / hit_rate_rolling (+ recent_pa) to each player dict.
+    If a player has no recent PA, fallback to conservative baselines so features differ.
+    """
+    enriched: List[dict] = []
     for pl in players:
         pid = int(pl["playerId"])
         r = rates.get(pid, {})
-        hr_rate  = r.get("hr_rate")
-        hit_rate = r.get("hit_rate")
-        if hr_rate is None:  hr_rate  = 0.02   # conservative fallback
-        if hit_rate is None: hit_rate = 0.24
+        hr_rate  = r.get("hr_rate") if r.get("hr_rate") is not None else 0.02
+        hit_rate = r.get("hit_rate") if r.get("hit_rate") is not None else 0.24
         pl2 = dict(pl)
         pl2["hr_rate_rolling"]  = float(hr_rate)
         pl2["hit_rate_rolling"] = float(hit_rate)
@@ -218,8 +242,8 @@ def apply_recent_rates(players: List[dict], rates: Dict[int, Dict[str, float | N
         enriched.append(pl2)
     return enriched
 
-# ========= Helpers: odds + math =========
-ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "").strip()  # optional
+# ================= Odds helpers (optional) =================
+ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "").strip()
 
 def american_to_prob(odds: Optional[int]) -> Optional[float]:
     if odds is None:
@@ -241,31 +265,98 @@ def prob_to_american(p: float) -> int:
     else:
         return int(round(((1 - p) * 100) / p))
 
-async def fetch_market_odds(date_iso: str) -> Dict[Tuple[int, str], Dict[str, Any]]:
+async def fetch_market_odds(date_iso: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """
-    Optional odds fetch. Returns a mapping: (playerId, market) -> {'odds': int, 'book': str}
-    Markets: 'HR', 'H1', 'H2'  (HR Anytime, 1+ Hits, 2+ Hits)
-    If THE_ODDS_API_KEY not set, returns {} and we skip odds (app still works).
+    Returns {(playerName_lower, market): {'odds': int, 'book': str}}
+    Markets we normalize:
+      'HR' -> HR Anytime
+      'H1' -> 1+ Hits (To Record a Hit)
+      'H2' -> 2+ Hits
+    If no API key or no data, returns {} (app still works).
     """
     if not ODDS_API_KEY:
         return {}
 
-    # Placeholder: many free tiers don't expose player props reliably.
-    # This function is structured so you can add a real provider later.
-    # For now, return empty dict so the rest of the pipeline works.
-    return {}
+    sport_key = "baseball_mlb"
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    params = {
+        "regions": "us",
+        "markets": "player_home_run,player_hits_over_under,player_total_hits",  # broad pull
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "apiKey": ODDS_API_KEY,
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, params=params, timeout=20)
+            if r.status_code != 200:
+                return {}
+            events = r.json()
+    except Exception:
+        return {}
 
-def score_pick(model_prob: float, market_prob: Optional[float], recent_pa: int, market: str) -> Tuple[float, float]:
-    """
-    Returns (edge, score_1_to_10).
-    edge = model_prob - market_prob (if market odds exist) else None-treated as 0 for score calc.
-    Score uses edge * confidence, with different weights per market.
-    """
-    # Confidence from sample size (last 30 days); saturate at 30 PA
-    conf = min(1.0, max(0.2, recent_pa / 30.0))  # floor to avoid zeroing early
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-    # Market-specific weight (HR is rarer → edges carry more)
-    weight = {"HR": 0.40, "H1": 0.25, "H2": 0.35}.get(market, 0.30)
+    def set_if_absent(key: Tuple[str, str], odds: int, book: str):
+        if key not in out:
+            out[key] = {"odds": odds, "book": book}
+
+    for ev in events or []:
+        for bk in ev.get("bookmakers", []) or []:
+            book_key = bk.get("key") or "book"
+            for mk in bk.get("markets", []) or []:
+                mk_key = (mk.get("key") or "").lower()
+                outcomes = mk.get("outcomes") or []
+                for oc in outcomes:
+                    name = (oc.get("description") or oc.get("name") or "").strip().lower()
+                    odds = oc.get("price")
+                    if odds is None:
+                        continue
+                    # try to parse a player name from outcome text
+                    pl_name = name
+                    for frag in [" to hit a home run", " - hr", " hr", " to record a hit", " over", " under", " hits", " total hits"]:
+                        pl_name = pl_name.replace(frag, "")
+                    pl_name = " ".join(pl_name.split()).strip()
+                    if not pl_name:
+                        continue
+
+                    market_norm: Optional[str] = None
+                    if "home run" in name or mk_key == "player_home_run":
+                        market_norm = "HR"
+                    elif "record a hit" in name:
+                        market_norm = "H1"
+                    elif "2+" in name and "hit" in name:
+                        market_norm = "H2"
+                    elif mk_key in ("player_hits_over_under", "player_total_hits"):
+                        # infer from line if present
+                        ln = oc.get("point")
+                        try:
+                            if ln is not None:
+                                ln_f = float(ln)
+                                if 0.5 <= ln_f < 1.5:
+                                    market_norm = "H1"
+                                elif 1.5 <= ln_f < 2.5:
+                                    market_norm = "H2"
+                        except Exception:
+                            pass
+                    if not market_norm:
+                        continue
+
+                    try:
+                        set_if_absent((pl_name, market_norm), int(odds), str(book_key))
+                    except Exception:
+                        continue
+
+    return out
+
+# ================= Edge + score =================
+def score_pick(model_prob: float, market_prob: Optional[float], recent_pa: int, market: str) -> Tuple[Optional[float], float]:
+    """
+    Returns (edge, score_1_to_10 with 0.1 steps). Edge is None if market_prob missing.
+    Score uses edge * confidence; HR weighted more due to rarity.
+    """
+    conf = min(1.0, max(0.2, recent_pa / 30.0))  # saturate at ~30 PA
+    weight = {"HR": 0.45, "H1": 0.25, "H2": 0.35}.get(market, 0.30)
 
     if market_prob is None:
         edge = None
@@ -274,115 +365,114 @@ def score_pick(model_prob: float, market_prob: Optional[float], recent_pa: int, 
         edge = model_prob - market_prob
         eff_edge = edge
 
-    # Base 5.0, add/subtract based on (edge% * weight * confidence)
-    edge_pct = (eff_edge * 100.0)
-    raw = 5.0 + (edge_pct * weight * conf) / 1.0
+    edge_pct = eff_edge * 100.0
+    raw = 5.0 + (edge_pct * weight * conf)
     score = max(1.0, min(10.0, raw))
-    # round to 0.1 increments
     score = round(score * 10.0) / 10.0
-    return (0.0 if edge is None else edge, score)
+    return edge, score
 
-# ========= Build payload =========
+# ================= Build payload =================
 async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, Any]]:
     if date is None:
         date = dt.date.today().isoformat()
 
-    if MISSING_MODEL_ARTIFACTS:
-        return [{
-            "date": date,
-            "playerId": -1,
-            "playerName": "Model not loaded",
-            "team": "",
-            "lineupSpot": None,
-            "hr_prob_pa_model": 0.0,
-            "hit_prob_pa_model": 0.0,
-            "hr_anytime_prob": 0.0,
-            "hits_1plus_prob": 0.0,
-            "hits_2plus_prob": 0.0,
-            "error": f"feature_builder import failed: {IMPORT_ERROR_DETAIL}",
-        }]
-
-    players = await fetch_lineups_for_today(date)
+    players = await fetch_players_for_today(date)
     if not players:
-        return []  # lineups not posted yet
+        return []  # nothing scheduled or API issue
 
-    # Enrich with last-30-day rates
+    # enrich with last-30d rates
     rates = await fetch_recent_rates(players, date, window_days=30)
     players = apply_recent_rates(players, rates)
 
-    # Model predictions (per-PA -> per-game markets)
+    if MISSING_MODEL_ARTIFACTS:
+        # graceful fallback so frontend still renders
+        payload = []
+        for p in players:
+            payload.append({
+                "date": date,
+                "playerId": p["playerId"],
+                "playerName": p["playerName"],
+                "team": p["team"],
+                "lineupSpot": p.get("lineupSpot"),
+                "hr_anytime_prob": 0.0,
+                "hits_1plus_prob": 0.0,
+                "hits_2plus_prob": 0.0,
+                "error": f"feature_builder import failed: {IMPORT_ERROR_DETAIL}",
+            })
+        return payload
+
+    # model predictions (robust builder ensures variation even if schema mismatch)
     preds = build_today_features(date, players)  # list[dict]
 
-    # Optional sportsbook odds
-    odds_map = await fetch_market_odds(date)  # {(playerId, 'HR'): {'odds': -105, 'book':'X'}, ...}
+    # optional sportsbook odds
+    odds_map = await fetch_market_odds(date)  # {(playerName_lower, 'HR'): {'odds': -110, 'book': '...'}, ...}
 
-    # Build final records with edges & scores
     out: List[Dict[str, Any]] = []
     for rec in preds:
+        name_l = str(rec["playerName"]).lower()
         pid = int(rec["playerId"])
         recent_pa = int(next((p.get("recent_pa", 0) for p in players if int(p["playerId"]) == pid), 0))
 
-        # Markets: HR, H1 (1+ Hits), H2 (2+ Hits)
-        hr_p  = float(rec["hr_anytime_prob"])
-        h1_p  = float(rec["hits_1plus_prob"])
-        h2_p  = float(rec["hits_2plus_prob"])
+        hr_p = float(rec["hr_anytime_prob"])
+        h1_p = float(rec["hits_1plus_prob"])
+        h2_p = float(rec["hits_2plus_prob"])
 
-        hr_odds = odds_map.get((pid, "HR"), {}).get("odds")
-        h1_odds = odds_map.get((pid, "H1"), {}).get("odds")
-        h2_odds = odds_map.get((pid, "H2"), {}).get("odds")
+        hr_odds = odds_map.get((name_l, "HR"), {}).get("odds")
+        h1_odds = odds_map.get((name_l, "H1"), {}).get("odds")
+        h2_odds = odds_map.get((name_l, "H2"), {}).get("odds")
 
-        hr_market_p = american_to_prob(hr_odds)
-        h1_market_p = american_to_prob(h1_odds)
-        h2_market_p = american_to_prob(h2_odds)
+        hr_mp = american_to_prob(hr_odds)
+        h1_mp = american_to_prob(h1_odds)
+        h2_mp = american_to_prob(h2_odds)
 
-        hr_edge, hr_score = score_pick(hr_p, hr_market_p, recent_pa, "HR")
-        h1_edge, h1_score = score_pick(h1_p, h1_market_p, recent_pa, "H1")
-        h2_edge, h2_score = score_pick(h2_p, h2_market_p, recent_pa, "H2")
+        hr_edge, hr_score = score_pick(hr_p, hr_mp, recent_pa, "HR")
+        h1_edge, h1_score = score_pick(h1_p, h1_mp, recent_pa, "H1")
+        h2_edge, h2_score = score_pick(h2_p, h2_mp, recent_pa, "H2")
 
-        rec_out = {
+        out.append({
             "date": rec["date"],
             "playerId": pid,
             "playerName": rec["playerName"],
             "team": rec["team"],
             "lineupSpot": rec.get("lineupSpot"),
 
-            # Model probabilities
+            # model probabilities
             "hr_anytime_prob": round(hr_p, 4),
             "hits_1plus_prob": round(h1_p, 4),
             "hits_2plus_prob": round(h2_p, 4),
 
-            # Optional market odds (None if not available)
+            # model-implied fair odds
+            "fair_hr_american": prob_to_american(hr_p),
+            "fair_h1_american": prob_to_american(h1_p),
+            "fair_h2_american": prob_to_american(h2_p),
+
+            # market odds (optional)
             "hr_market_odds": hr_odds,
             "h1_market_odds": h1_odds,
             "h2_market_odds": h2_odds,
-            "hr_market_prob": None if hr_market_p is None else round(hr_market_p, 4),
-            "h1_market_prob": None if h1_market_p is None else round(h1_market_p, 4),
-            "h2_market_prob": None if h2_market_p is None else round(h2_market_p, 4),
+            "hr_market_prob": None if hr_mp is None else round(hr_mp, 4),
+            "h1_market_prob": None if h1_mp is None else round(h1_mp, 4),
+            "h2_market_prob": None if h2_mp is None else round(h2_mp, 4),
 
-            # Edge (model - market) where market exists
-            "hr_edge": round(hr_edge, 4) if hr_market_p is not None else None,
-            "h1_edge": round(h1_edge, 4) if h1_market_p is not None else None,
-            "h2_edge": round(h2_edge, 4) if h2_market_p is not None else None,
+            # edge & score
+            "hr_edge": None if hr_edge is None else round(hr_edge, 4),
+            "h1_edge": None if h1_edge is None else round(h1_edge, 4),
+            "h2_edge": None if h2_edge is None else round(h2_edge, 4),
 
-            # Scores 1.0–10.0 (0.1 steps). Uses edge if market exists, else confidence-weighted baseline.
             "hr_score": hr_score,
             "h1_score": h1_score,
             "h2_score": h2_score,
 
-            # Extras for UI/context
+            # extras for UI / QA
             "recent_pa": recent_pa,
-            "fair_hr_american": prob_to_american(hr_p),
-            "fair_h1_american": prob_to_american(h1_p),
-            "fair_h2_american": prob_to_american(h2_p),
-        }
-        out.append(rec_out)
+        })
 
     return out
 
-# ========= Routes =========
+# ================= Routes =================
 @app.get("/health")
 async def health():
-    return {"ok": True, "time": dt.datetime.utcnow().isoformat()}
+    return {"ok": True, "time": dt.datetime.utcnow().isoformat(), "model_missing": MISSING_MODEL_ARTIFACTS, "import_error": IMPORT_ERROR_DETAIL}
 
 @app.get("/markets")
 async def markets(date: str | None = None):
