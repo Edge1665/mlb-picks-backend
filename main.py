@@ -1,8 +1,7 @@
-# main.py — lineups + roster fallback + recent rates + sportsbook odds + edge + scores
+# main.py — lineups + roster fallback + recent rates + sportsbook odds + edge + baseline-aware scores
 from __future__ import annotations
 
 import os
-import math
 import asyncio
 import datetime as dt
 from typing import Optional, List, Dict, Any, Tuple
@@ -11,11 +10,11 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# ---------------- Model feature builder ----------------
+# ---------------- Model feature builder (robust version that uses hr_rate_rolling/hit_rate_rolling) ----------------
 MISSING_MODEL_ARTIFACTS = False
 IMPORT_ERROR_DETAIL = ""
 try:
-    # robust builder should be: build_today_features(date_str: str, players: list[dict]) -> list[dict]
+    # robust builder signature: build_today_features(date_str: str, players: list[dict]) -> list[dict]
     from feature_builder import build_today_features
 except Exception as e:
     MISSING_MODEL_ARTIFACTS = True
@@ -32,23 +31,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------- Baseline probabilities (used when no sportsbook odds available) ----------------
+# Conservative league-wide per-game averages; tweak anytime.
+BASELINE_PROB = {
+    "HR": 0.045,  # HR Anytime ~4.5%
+    "H1": 0.63,   # 1+ Hit ~63%
+    "H2": 0.24,   # 2+ Hits ~24%
+}
+
 # ================= MLB API helpers =================
-async def _get_game_pks_for_date(client: httpx.AsyncClient, date_str: str) -> List[int]:
+async def _get_game_pks_and_teams_for_date(client: httpx.AsyncClient, date_str: str) -> Tuple[List[int], List[Tuple[int, str]]]:
+    """Return (game_pks, [(team_id, team_name), ...]) for a date."""
     url = "https://statsapi.mlb.com/api/v1/schedule"
     params = {"sportId": 1, "date": date_str}
     r = await client.get(url, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
     pks: List[int] = []
-    for d in data.get("dates", []):
-        for g in d.get("games", []):
+    teams_today: List[Tuple[int, str]] = []
+    for d in data.get("dates", []) or []:
+        for g in d.get("games", []) or []:
             pk = g.get("gamePk")
             if pk:
                 pks.append(int(pk))
-    return pks
+            for side in ("home", "away"):
+                tinfo = g.get(f"{side}Team", {}) or {}
+                tid = tinfo.get("id")
+                # some schedule payloads nest the name under 'team', others inline
+                tname = (tinfo.get("team", {}) or {}).get("name") or tinfo.get("name") or ""
+                if tid:
+                    teams_today.append((int(tid), str(tname)))
+    return pks, teams_today
 
 def _extract_lineup_from_boxscore_json(js: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Parse a boxscore for batting orders (1–9)."""
+    """Parse a boxscore JSON for batting orders (1–9)."""
     out: List[Dict[str, Any]] = []
     for side in ("home", "away"):
         team_name = js.get("teams", {}).get(side, {}).get("team", {}).get("name", "")
@@ -108,8 +124,7 @@ async def _fetch_team_roster(client: httpx.AsyncClient, team_id: int, team_name:
             pid = person.get("id")
             name = person.get("fullName") or "Unknown"
             pos = (item.get("position", {}) or {}).get("abbreviation", "")
-            # skip pitchers in fallback so the board isn't polluted
-            if pid and pos != "P":
+            if pid and pos != "P":  # skip pitchers
                 out.append({
                     "playerId": int(pid),
                     "playerName": str(name),
@@ -122,31 +137,14 @@ async def _fetch_team_roster(client: httpx.AsyncClient, team_id: int, team_name:
 
 async def fetch_players_for_today(date_str: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Use posted lineups when available; otherwise fall back to active rosters for the teams playing today.
+    Use posted lineups when available; otherwise fall back to active rosters for today’s teams (hitters only).
     """
     if not date_str:
         date_str = dt.date.today().isoformat()
     async with httpx.AsyncClient() as client:
-        # which games today?
-        schedule_url = "https://statsapi.mlb.com/api/v1/schedule"
-        rs = await client.get(schedule_url, params={"sportId": 1, "date": date_str}, timeout=20)
-        rs.raise_for_status()
-        sched = rs.json()
-        game_pks: List[int] = []
-        teams_today: List[Tuple[int, str]] = []  # (team_id, team_name)
-        for d in sched.get("dates", []) or []:
-            for g in d.get("games", []) or []:
-                pk = g.get("gamePk")
-                if pk:
-                    game_pks.append(int(pk))
-                # collect team ids & names for roster fallback
-                for side in ("home", "away"):
-                    tinfo = g.get(f"{side}Team", {}) or {}
-                    tid = tinfo.get("id")
-                    tname = (tinfo.get("team", {}) or {}).get("name") or tinfo.get("name") or ""
-                    if tid:
-                        teams_today.append((int(tid), str(tname)))
-        # First, try to pull posted lineups via boxscore
+        game_pks, teams_today = await _get_game_pks_and_teams_for_date(client, date_str)
+
+        # Try to pull posted lineups via boxscore for all games
         if game_pks:
             lineup_results = await asyncio.gather(
                 *(asyncio.create_task(_fetch_boxscore_lineups(client, pk)) for pk in game_pks),
@@ -165,12 +163,13 @@ async def fetch_players_for_today(date_str: Optional[str] = None) -> List[Dict[s
                     seen.add(r["playerId"]); dedup.append(r)
                 return dedup
 
-        # Fallback: use active rosters for the teams playing today
-        # dedupe team list
+        # Fallback: active rosters for the teams playing today
         team_map: Dict[int, str] = {}
         for tid, tname in teams_today:
             if tid not in team_map:
                 team_map[tid] = tname
+        if not team_map:
+            return []
         roster_results = await asyncio.gather(
             *(_fetch_team_roster(client, tid, team_map.get(tid, "")) for tid in team_map.keys()),
             return_exceptions=True
@@ -196,6 +195,8 @@ async def fetch_recent_rates(players: List[dict], date_iso: str, window_days: in
     start_dt = end_dt - dt.timedelta(days=window_days)
     start, end = start_dt.isoformat(), end_dt.isoformat()
     ids = sorted({int(p["playerId"]) for p in players})
+    if not ids:
+        return {}
 
     async with httpx.AsyncClient() as client:
         async def one(pid: int):
@@ -281,7 +282,7 @@ async def fetch_market_odds(date_iso: str) -> Dict[Tuple[str, str], Dict[str, An
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
         "regions": "us",
-        "markets": "player_home_run,player_hits_over_under,player_total_hits",  # broad pull
+        "markets": "player_home_run,player_hits_over_under,player_total_hits",
         "oddsFormat": "american",
         "dateFormat": "iso",
         "apiKey": ODDS_API_KEY,
@@ -312,7 +313,7 @@ async def fetch_market_odds(date_iso: str) -> Dict[Tuple[str, str], Dict[str, An
                     odds = oc.get("price")
                     if odds is None:
                         continue
-                    # try to parse a player name from outcome text
+                    # parse player name from outcome text
                     pl_name = name
                     for frag in [" to hit a home run", " - hr", " hr", " to record a hit", " over", " under", " hits", " total hits"]:
                         pl_name = pl_name.replace(frag, "")
@@ -328,7 +329,6 @@ async def fetch_market_odds(date_iso: str) -> Dict[Tuple[str, str], Dict[str, An
                     elif "2+" in name and "hit" in name:
                         market_norm = "H2"
                     elif mk_key in ("player_hits_over_under", "player_total_hits"):
-                        # infer from line if present
                         ln = oc.get("point")
                         try:
                             if ln is not None:
@@ -349,18 +349,23 @@ async def fetch_market_odds(date_iso: str) -> Dict[Tuple[str, str], Dict[str, An
 
     return out
 
-# ================= Edge + score =================
+# ================= Edge + baseline-aware score =================
 def score_pick(model_prob: float, market_prob: Optional[float], recent_pa: int, market: str) -> Tuple[Optional[float], float]:
     """
-    Returns (edge, score_1_to_10 with 0.1 steps). Edge is None if market_prob missing.
-    Score uses edge * confidence; HR weighted more due to rarity.
+    Returns (edge, score_1_to_10 in 0.1 steps).
+    - With odds: edge = model_prob - market_prob
+    - Without odds: edge=None, but score compares model_prob to a baseline for that market.
+    Score scales with recent sample size (last 30d PA) and market weight (HR > H2 > H1).
     """
-    conf = min(1.0, max(0.2, recent_pa / 30.0))  # saturate at ~30 PA
+    # Confidence from last-30d PA: saturate ~30 PA, floor 0.2
+    conf = min(1.0, max(0.2, recent_pa / 30.0))
+    # Market weights (rarer outcome → higher weight)
     weight = {"HR": 0.45, "H1": 0.25, "H2": 0.35}.get(market, 0.30)
 
     if market_prob is None:
+        baseline = BASELINE_PROB.get(market, 0.5)
         edge = None
-        eff_edge = 0.0
+        eff_edge = model_prob - baseline
     else:
         edge = model_prob - market_prob
         eff_edge = edge
@@ -397,12 +402,28 @@ async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, 
                 "hr_anytime_prob": 0.0,
                 "hits_1plus_prob": 0.0,
                 "hits_2plus_prob": 0.0,
+                "fair_hr_american": None,
+                "fair_h1_american": None,
+                "fair_h2_american": None,
+                "hr_market_odds": None,
+                "h1_market_odds": None,
+                "h2_market_odds": None,
+                "hr_market_prob": None,
+                "h1_market_prob": None,
+                "h2_market_prob": None,
+                "hr_edge": None,
+                "h1_edge": None,
+                "h2_edge": None,
+                "hr_score": 5.0,
+                "h1_score": 5.0,
+                "h2_score": 5.0,
+                "recent_pa": p.get("recent_pa", 0),
                 "error": f"feature_builder import failed: {IMPORT_ERROR_DETAIL}",
             })
         return payload
 
     # model predictions (robust builder ensures variation even if schema mismatch)
-    preds = build_today_features(date, players)  # list[dict]
+    preds = build_today_features(date, players)  # list[dict] with hr_anytime_prob, hits_1plus_prob, hits_2plus_prob
 
     # optional sportsbook odds
     odds_map = await fetch_market_odds(date)  # {(playerName_lower, 'HR'): {'odds': -110, 'book': '...'}, ...}
@@ -430,10 +451,10 @@ async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, 
         h2_edge, h2_score = score_pick(h2_p, h2_mp, recent_pa, "H2")
 
         out.append({
-            "date": rec["date"],
+            "date": rec.get("date", date),
             "playerId": pid,
             "playerName": rec["playerName"],
-            "team": rec["team"],
+            "team": rec.get("team", ""),
             "lineupSpot": rec.get("lineupSpot"),
 
             # model probabilities
@@ -454,17 +475,22 @@ async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, 
             "h1_market_prob": None if h1_mp is None else round(h1_mp, 4),
             "h2_market_prob": None if h2_mp is None else round(h2_mp, 4),
 
-            # edge & score
+            # edge & score (score works even without odds thanks to baselines)
             "hr_edge": None if hr_edge is None else round(hr_edge, 4),
             "h1_edge": None if h1_edge is None else round(h1_edge, 4),
             "h2_edge": None if h2_edge is None else round(h2_edge, 4),
-
             "hr_score": hr_score,
             "h1_score": h1_score,
             "h2_score": h2_score,
 
             # extras for UI / QA
             "recent_pa": recent_pa,
+            # if your robust feature_builder includes these, they’ll pass through; otherwise ignore
+            "hr_prob_pa_model": rec.get("hr_prob_pa_model"),
+            "hit_prob_pa_model": rec.get("hit_prob_pa_model"),
+            "hr_rate_rolling": rec.get("hr_rate_rolling"),
+            "hit_rate_rolling": rec.get("hit_rate_rolling"),
+            "n_pa_est": rec.get("n_pa_est"),
         })
 
     return out
@@ -472,7 +498,12 @@ async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, 
 # ================= Routes =================
 @app.get("/health")
 async def health():
-    return {"ok": True, "time": dt.datetime.utcnow().isoformat(), "model_missing": MISSING_MODEL_ARTIFACTS, "import_error": IMPORT_ERROR_DETAIL}
+    return {
+        "ok": True,
+        "time": dt.datetime.utcnow().isoformat(),
+        "model_missing": MISSING_MODEL_ARTIFACTS,
+        "import_error": IMPORT_ERROR_DETAIL
+    }
 
 @app.get("/markets")
 async def markets(date: str | None = None):
