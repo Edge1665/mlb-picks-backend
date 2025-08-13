@@ -320,4 +320,122 @@ async def fetch_market_odds(date_iso: str) -> Dict[Tuple[str, str], Dict[str, An
         Store first seen; replace if new one is FanDuel.
         """
         cur = out.get(key)
-        if (cur is None) or (cur["book
+        if (cur is None) or (cur["book"] != "fanduel" and book == "fanduel"):
+            out[key] = {"odds": int(odds), "book": str(book)}
+
+    for ev in events or []:
+        for bk in ev.get("bookmakers", []) or []:
+            book_key = (bk.get("key") or "book").lower()
+            for mk in bk.get("markets", []) or []:
+                mk_key = (mk.get("key") or "").lower()
+                outcomes = mk.get("outcomes") or []
+                for oc in outcomes:
+                    raw = (oc.get("description") or oc.get("name") or "").strip()
+                    name_l = raw.lower()
+                    odds = oc.get("price")
+                    if odds is None:
+                        continue
+
+                    # Determine market & extract player name
+                    market_norm: Optional[str] = None
+                    if "home run" in name_l or mk_key == "player_home_run":
+                        market_norm = "HR"
+                        pl_name = raw
+                        for frag in [" to hit a home run", " - hr", " hr"]:
+                            pl_name = pl_name.replace(frag, "")
+                    elif mk_key in ("player_hits_over_under", "player_total_hits"):
+                        point = oc.get("point")
+                        is_over = _looks_like_over(name_l)
+                        if point is None or not is_over:
+                            continue
+                        try:
+                            pt = float(point)
+                        except Exception:
+                            continue
+                        if 0.5 <= pt < 1.5:
+                            market_norm = "H1"
+                        elif 1.5 <= pt < 2.5:
+                            market_norm = "H2"
+                        else:
+                            continue
+                        pl_name = raw
+                        for frag in [" over", " under", " hits", " total hits"]:
+                            pl_name = pl_name.replace(frag, "")
+                    elif "record a hit" in name_l:
+                        market_norm = "H1"
+                        pl_name = raw.replace(" to record a hit", "")
+                    else:
+                        continue
+
+                    pl_key = normalize_name(pl_name)
+                    if not pl_key:
+                        continue
+
+                    try:
+                        set_preferring_fanduel((pl_key, market_norm), int(odds), book_key)
+                    except Exception:
+                        continue
+
+    return out
+
+# ================= Edge + smooth baseline-aware score =================
+def score_pick(model_prob: float, market_prob: Optional[float], recent_pa: int, market: str) -> Tuple[Optional[float], float]:
+    """
+    Returns (edge, score_1_to_10).
+    - With odds: edge = model_prob - market_prob
+    - Without odds: edge=None, but score compares model_prob to a baseline for that market.
+    Uses a smooth tanh to avoid everything pegging at 10.
+    """
+    # Confidence from last-30d PA: saturate ~30 PA, floor 0.2
+    conf = min(1.0, max(0.2, recent_pa / 30.0))
+
+    # Market weights (rarer outcome → higher impact)
+    weight = {"HR": 1.1, "H2": 0.8, "H1": 0.6}.get(market, 0.7)
+
+    if market_prob is None:
+        baseline = BASELINE_PROB.get(market, 0.5)
+        edge = None
+        eff_edge = model_prob - baseline
+    else:
+        edge = model_prob - market_prob
+        eff_edge = edge
+
+    # scale (percentage points) to keep scores in a nice spread
+    S = {"HR": 6.0, "H2": 10.0, "H1": 14.0}.get(market, 10.0)
+    edge_pct = eff_edge * 100.0
+
+    # Smooth mapping around 5.0 using tanh; multiplied by confidence and market weight
+    delta = math.tanh((edge_pct / S) * weight * conf)  # in [-1, 1]
+    score = 5.0 + 4.5 * delta  # yields [0.5, 9.5] before clamp
+    score = max(1.0, min(10.0, round(score * 10.0) / 10.0))
+    return edge, score
+
+# ================= Build payload =================
+async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, Any]]:
+    if date is None:
+        date = dt.date.today().isoformat()
+
+    players = await fetch_players_for_today(date)
+    if not players:
+        return []  # nothing scheduled or API issue
+
+    # enrich with last-30d rates
+    rates = await fetch_recent_rates(players, date, window_days=30)
+    players = apply_recent_rates(players, rates)
+
+    if MISSING_MODEL_ARTIFACTS:
+        payload = []
+        for p in players:
+            payload.append({
+                "date": date,
+                "playerId": p["playerId"],
+                "playerName": p["playerName"],
+                "team": p["team"],
+                "lineupSpot": p.get("lineupSpot"),
+                "hr_anytime_prob": 0.0,
+                "hits_1plus_prob": 0.0,
+                "hits_2plus_prob": 0.0,
+                "fair_hr_american": None,
+                "fair_h1_american": None,
+                "fair_h2_american": None,
+                "hr_market_odds
