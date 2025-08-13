@@ -438,4 +438,109 @@ async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, 
                 "fair_hr_american": None,
                 "fair_h1_american": None,
                 "fair_h2_american": None,
-                "hr_market_odds
+                "hr_market_odds": None,
+                "h1_market_odds": None,
+                "h2_market_odds": None,
+                "hr_market_prob": None,
+                "h1_market_prob": None,
+                "h2_market_prob": None,
+                "hr_edge": None,
+                "h1_edge": None,
+                "h2_edge": None,
+                "hr_score": 5.0,
+                "h1_score": 5.0,
+                "h2_score": 5.0,
+                "recent_pa": p.get("recent_pa", 0),
+                "error": f"feature_builder import failed: {IMPORT_ERROR_DETAIL}",
+            })
+        return payload
+
+    # model predictions (robust builder ensures variation even if schema mismatch)
+    preds = build_today_features(date, players)  # list[dict]
+
+    # optional sportsbook odds
+    odds_map = await fetch_market_odds(date)  # {(normalized_name, 'HR'): {'odds': -110, 'book': '...'}, ...}
+
+    out: List[Dict[str, Any]] = []
+    for rec in preds:
+        # normalize name for odds lookup
+        name_key = normalize_name(str(rec["playerName"]))
+        pid = int(rec["playerId"])
+        recent_pa = int(next((p.get("recent_pa", 0) for p in players if int(p["playerId"]) == pid), 0))
+
+        # ensure model probabilities are sane before using them
+        hr_p = max(0.0005, min(0.9995, float(rec["hr_anytime_prob"])))
+        h1_p = max(0.0005, min(0.9995, float(rec["hits_1plus_prob"])))
+        h2_p = max(0.0005, min(0.9995, float(rec["hits_2plus_prob"])))
+
+        hr_odds = odds_map.get((name_key, "HR"), {}).get("odds")
+        h1_odds = odds_map.get((name_key, "H1"), {}).get("odds")
+        h2_odds = odds_map.get((name_key, "H2"), {}).get("odds")
+
+        hr_mp = american_to_prob(hr_odds)
+        h1_mp = american_to_prob(h1_odds)
+        h2_mp = american_to_prob(h2_odds)
+
+        hr_edge, hr_score = score_pick(hr_p, hr_mp, recent_pa, "HR")
+        h1_edge, h1_score = score_pick(h1_p, h1_mp, recent_pa, "H1")
+        h2_edge, h2_score = score_pick(h2_p, h2_mp, recent_pa, "H2")
+
+        out.append({
+            "date": rec.get("date", date),
+            "playerId": pid,
+            "playerName": rec["playerName"],
+            "team": rec.get("team", ""),
+            "lineupSpot": rec.get("lineupSpot"),
+
+            # model probabilities (per game)
+            "hr_anytime_prob": round(hr_p, 4),
+            "hits_1plus_prob": round(h1_p, 4),
+            "hits_2plus_prob": round(h2_p, 4),
+
+            # model-implied fair odds (clamped)
+            "fair_hr_american": prob_to_american(hr_p),
+            "fair_h1_american": prob_to_american(h1_p),
+            "fair_h2_american": prob_to_american(h2_p),
+
+            # market odds (optional)
+            "hr_market_odds": hr_odds,
+            "h1_market_odds": h1_odds,
+            "h2_market_odds": h2_odds,
+            "hr_market_prob": None if hr_mp is None else round(hr_mp, 4),
+            "h1_market_prob": None if h1_mp is None else round(h1_mp, 4),
+            "h2_market_prob": None if h2_mp is None else round(h2_mp, 4),
+
+            # edge & score
+            "hr_edge": None if hr_edge is None else round(hr_edge, 4),
+            "h1_edge": None if h1_edge is None else round(h1_edge, 4),
+            "h2_edge": None if h2_edge is None else round(h2_edge, 4),
+            "hr_score": hr_score,
+            "h1_score": h1_score,
+            "h2_score": h2_score,
+
+            # extras for UI / QA (pass-through if present)
+            "recent_pa": recent_pa,
+            "hr_prob_pa_model": rec.get("hr_prob_pa_model"),
+            "hit_prob_pa_model": rec.get("hit_prob_pa_model"),
+            "hr_rate_rolling": rec.get("hr_rate_rolling"),
+            "hit_rate_rolling": rec.get("hit_rate_rolling"),
+            "n_pa_est": rec.get("n_pa_est"),
+        })
+
+    return out
+
+# ================= Routes =================
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "time": dt.datetime.utcnow().isoformat(),
+        "model_missing": MISSING_MODEL_ARTIFACTS,
+        "import_error": IMPORT_ERROR_DETAIL
+    }
+
+@app.get("/markets")
+async def markets(date: str | None = None):
+    if not date:
+        date = dt.date.today().isoformat()
+    return await compute_markets_payload(date)
