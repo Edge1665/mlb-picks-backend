@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # ===================== ENV / CONFIG =====================
 
@@ -19,7 +20,7 @@ ALLOWED_ORIGINS = [o for o in (os.getenv("ALLOWED_ORIGINS") or "*").split(",") i
 
 # ===================== APP ==============================
 
-app = FastAPI(title=BACKEND_NAME, version="1.2.0")
+app = FastAPI(title=BACKEND_NAME, version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +35,7 @@ app.add_middleware(
 MODEL_OK = True
 MODEL_IMPORT_ERROR = None
 try:
-    from feature_builder import build_today_features  # uses per-PA rates -> per-game probs
+    from feature_builder import build_today_features  # converts per-PA rates -> per-game
 except Exception as e:
     MODEL_OK = False
     MODEL_IMPORT_ERROR = str(e)
@@ -74,21 +75,11 @@ def choose_best(current: Optional[Dict[str, Any]], cand: Dict[str, Any]) -> Dict
         return cand
     return current
 
-async def _http_get_json(client: httpx.AsyncClient, url: str, params: dict | None = None):
-    try:
-        r = await client.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:
-        return None
-
 # ===================== LINEUPS / ROSTER =================
 
 async def fetch_lineups_for_today(date_iso: str) -> List[Dict[str, Any]]:
     """
     Placeholder for posted lineups. Return [] so we fall back to rosters.
-    You can replace this later with a real lineup source.
     """
     return []
 
@@ -99,8 +90,9 @@ async def fetch_team_rosters_for_today(date_iso: str) -> List[Dict[str, Any]]:
     """
     out: List[Dict[str, Any]] = []
     try:
-        async with httpx.AsyncClient() as client:
-            teams_r = await client.get("https://statsapi.mlb.com/api/v1/teams?sportId=1", timeout=20)
+        headers = {"User-Agent": "mlb-picks/1.0 (+https://example.com)"}
+        async with httpx.AsyncClient(headers=headers) as client:
+            teams_r = await client.get("https://statsapi.mlb.com/api/v1/teams?sportId=1", timeout=25)
             teams_r.raise_for_status()
             teams = (teams_r.json() or {}).get("teams", []) or []
 
@@ -110,7 +102,7 @@ async def fetch_team_rosters_for_today(date_iso: str) -> List[Dict[str, Any]]:
                 if not tid:
                     continue
 
-                roster_r = await client.get(f"https://statsapi.mlb.com/api/v1/teams/{tid}/roster", timeout=20)
+                roster_r = await client.get(f"https://statsapi.mlb.com/api/v1/teams/{tid}/roster", timeout=25)
                 if roster_r.status_code != 200:
                     continue
                 for slot in (roster_r.json() or {}).get("roster", []) or []:
@@ -123,7 +115,7 @@ async def fetch_team_rosters_for_today(date_iso: str) -> List[Dict[str, Any]]:
                         "playerId": int(pid),
                         "playerName": pname,
                         "team": abbr,
-                        "lineupSpot": None,  # unknown until lineups post
+                        "lineupSpot": None,
                     })
     except Exception:
         pass
@@ -145,32 +137,49 @@ async def fetch_recent_rates(players: List[Dict[str, Any]], date_iso: str, windo
         season = dt.date.today().year
 
     base_url = "https://statsapi.mlb.com/api/v1/people/{pid}/stats"
-    sem = asyncio.Semaphore(12)
+    sem = asyncio.Semaphore(16)  # allow some concurrency
 
-    async def fetch_one(pid: int):
-        url = base_url.format(pid=pid)
-        params = {"stats": "season", "group": "hitting", "season": str(season), "gameType": "R"}
-        async with sem:
-            async with httpx.AsyncClient() as client:
-                data = await _http_get_json(client, url, params)
+    headers = {"User-Agent": "mlb-picks/1.0 (+https://example.com)"}
+    async with httpx.AsyncClient(headers=headers) as client:
 
-        hr_rate, hit_rate, pa = 0.02, 0.24, 0
-        try:
-            splits = (((data or {}).get("stats") or [])[0].get("splits") or [])
-            if splits:
-                stat = splits[0].get("stat") or {}
-                pa = int(stat.get("plateAppearances") or 0)
-                hr = int(stat.get("homeRuns") or 0)
-                h = int(stat.get("hits") or 0)
-                if pa > 0:
-                    hr_rate = max(0.0005, min(0.9995, hr / pa))
-                    hit_rate = max(0.0005, min(0.9995, h / pa))
-        except Exception:
-            pass
-        return pid, {"hr_rate_rolling": hr_rate, "hit_rate_rolling": hit_rate, "recent_pa": pa}
+        async def fetch_one(pid: int):
+            url = base_url.format(pid=pid)
+            params = {"stats": "season", "group": "hitting", "season": str(season), "gameType": "R"}
+            try:
+                r = await client.get(url, params=params, timeout=25)
+                if r.status_code != 200:
+                    raise RuntimeError(f"statsapi {r.status_code}")
+                data = r.json()
+            except Exception:
+                data = None
 
-    tasks = [fetch_one(int(p["playerId"])) for p in players if p.get("playerId")]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+            hr_rate, hit_rate, pa = 0.02, 0.24, 0
+            try:
+                splits = (((data or {}).get("stats") or [])[0].get("splits") or [])
+                if splits:
+                    stat = splits[0].get("stat") or {}
+                    pa = int(stat.get("plateAppearances") or 0)
+                    hr = int(stat.get("homeRuns") or 0)
+                    h = int(stat.get("hits") or 0)
+                    if pa > 0:
+                        hr_rate = max(0.0005, min(0.9995, hr / pa))
+                        hit_rate = max(0.0005, min(0.9995, h / pa))
+            except Exception:
+                pass
+            return pid, {"hr_rate_rolling": hr_rate, "hit_rate_rolling": hit_rate, "recent_pa": pa}
+
+        tasks = []
+        seen: set[int] = set()
+        for p in players:
+            pid = int(p.get("playerId") or 0)
+            if pid and pid not in seen:
+                seen.add(pid)
+                async def runner(pid=pid):
+                    async with sem:
+                        return await fetch_one(pid)
+                tasks.append(runner())
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
     rates: Dict[int, Dict[str, Any]] = {}
     for res in results:
@@ -227,9 +236,10 @@ async def fetch_market_odds(date_iso: str) -> Dict[Tuple[str, str], Dict[str, An
             "dateFormat": "iso",
             "apiKey": ODDS_API_KEY,
         }
+        headers = {"User-Agent": "mlb-picks/1.0 (+https://example.com)"}
         try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(url, params=params, timeout=20)
+            async with httpx.AsyncClient(headers=headers) as client:
+                r = await client.get(url, params=params, timeout=25)
                 if r.status_code != 200:
                     return []
                 return r.json() or []
@@ -328,6 +338,29 @@ async def health():
         "time": dt.datetime.utcnow().isoformat() + "Z",
     }
 
+@app.get("/rates_status")
+async def rates_status(date: str | None = None):
+    if not date:
+        date = dt.date.today().isoformat()
+    players = await fetch_team_rosters_for_today(date)
+    rates = await fetch_recent_rates(players, date, window_days=30)
+    vals_hr = [r["hr_rate_rolling"] for r in rates.values()]
+    vals_hit = [r["hit_rate_rolling"] for r in rates.values()]
+    def summarize(xs: List[float]):
+        if not xs:
+            return {"min": None, "max": None, "avg": None, "n": 0}
+        return {
+            "min": min(xs), "max": max(xs), "avg": sum(xs)/len(xs), "n": len(xs)
+        }
+    return {
+        "date": date,
+        "players": len(players),
+        "rates": {
+            "hr_rate_rolling": summarize(vals_hr),
+            "hit_rate_rolling": summarize(vals_hit),
+        }
+    }
+
 @app.get("/odds_status")
 async def odds_status():
     has_key = bool(ODDS_API_KEY)
@@ -342,22 +375,40 @@ async def odds_status():
         "note": "If tot_props=0, your key/plan/region likely lacks player props. Model works; edges will be null.",
     }
 
+@app.get("/debug_summary")
+async def debug_summary(date: str | None = None):
+    if not date:
+        date = dt.date.today().isoformat()
+    players = await fetch_team_rosters_for_today(date)
+    rates = await fetch_recent_rates(players, date, window_days=30)
+    enriched = apply_recent_rates(players, rates)
+    if not MODEL_OK:
+        return {"model_loaded": False, "error": MODEL_IMPORT_ERROR}
+    modeled = build_today_features(date, enriched)
+    def col(xs, key): 
+        vs = [float(x.get(key) or 0.0) for x in xs]
+        if not vs: 
+            return {"min": None, "max": None, "avg": None, "n": 0}
+        return {"min": min(vs), "max": max(vs), "avg": sum(vs)/len(vs), "n": len(vs)}
+    return {
+        "model_loaded": True,
+        "date": date,
+        "counts": len(modeled),
+        "hr_pa": col(modeled, "hr_prob_pa_model"),
+        "hit_pa": col(modeled, "hit_prob_pa_model"),
+        "hr_game": col(modeled, "hr_anytime_prob"),
+        "h1_game": col(modeled, "hits_1plus_prob"),
+        "h2_game": col(modeled, "hits_2plus_prob"),
+    }
+
 @app.get("/markets")
 async def markets(date: str = Query(default=None)):
     """
     Returns an array of player rows for the chosen date (YYYY-MM-DD).
 
-    Model fields:
-      - hr_prob_pa_model, hit_prob_pa_model (per-PA)
-      - n_pa_est (estimated PAs used)
-      - hr_anytime_prob, hits_1plus_prob, hits_2plus_prob (per-game)
-
-    Market fields (if provider returns props):
-      - hr_market_odds, h1_market_odds, h2_market_odds (American)
-      - hr_market_prob, h1_market_prob, h2_market_prob
-      - fair_hr_american, fair_h1_american, fair_h2_american
-      - hr_edge, h1_edge, h2_edge
-      - hr_score, h1_score, h2_score
+    Game-level fields:
+      - hr_anytime_prob, hits_1plus_prob, hits_2plus_prob
+      - aliases: hr_game_prob, h1_game_prob, h2_game_prob
     """
     if not date:
         date = dt.date.today().isoformat()
@@ -369,7 +420,7 @@ async def markets(date: str = Query(default=None)):
     if not players:
         players = await fetch_team_rosters_for_today(date)
     if not players:
-        return []
+        return JSONResponse(content=[], headers={"Cache-Control": "no-store"})
 
     # 3) Season-to-date rates (free) so values vary
     rates = await fetch_recent_rates(players, date, window_days=30)
@@ -377,19 +428,23 @@ async def markets(date: str = Query(default=None)):
 
     # 4) Build per-game probabilities from per-PA rates
     if not MODEL_OK:
-        return [{
-            "date": date,
-            "playerId": -1,
-            "playerName": "Model not loaded",
-            "team": "",
-            "lineupSpot": None,
-            "hr_prob_pa_model": 0.0,
-            "hit_prob_pa_model": 0.0,
-            "hr_anytime_prob": 0.0,
-            "hits_1plus_prob": 0.0,
-            "hits_2plus_prob": 0.0,
-            "error": f"feature_builder import failed: {MODEL_IMPORT_ERROR}",
-        }]
+        return JSONResponse(
+            content=[{
+                "date": date,
+                "playerId": -1,
+                "playerName": "Model not loaded",
+                "team": "",
+                "lineupSpot": None,
+                "hr_prob_pa_model": 0.0,
+                "hit_prob_pa_model": 0.0,
+                "hr_anytime_prob": 0.0,
+                "hits_1plus_prob": 0.0,
+                "hits_2plus_prob": 0.0,
+                "error": f"feature_builder import failed: {MODEL_IMPORT_ERROR}",
+            }],
+            headers={"Cache-Control": "no-store"},
+        )
+
     modeled = build_today_features(date, players)
 
     # 5) Odds (may be empty if plan lacks player props)
@@ -427,37 +482,30 @@ async def markets(date: str = Query(default=None)):
         rows.append({
             **row,
 
-            # Clear game-level aliases for the frontend (use these in UI)
+            # explicit game-level aliases for the UI
             "hr_game_prob": p_hr,
-            "h1_game_prob": p_h1,   # 1+ hit
-            "h2_game_prob": p_h2,   # 2+ hits
+            "h1_game_prob": p_h1,
+            "h2_game_prob": p_h2,
 
-            # Fair odds from the model
             "fair_hr_american": fair_hr,
             "fair_h1_american": fair_h1,
             "fair_h2_american": fair_h2,
 
-            # Market odds, if present
             "hr_market_odds": hr_odds if hr_odds is not None else None,
             "h1_market_odds": h1_odds if h1_odds is not None else None,
             "h2_market_odds": h2_odds if h2_odds is not None else None,
 
-            # Market implied probabilities (may be null if no odds returned)
             "hr_market_prob": hr_mkt_p,
             "h1_market_prob": h1_mkt_p,
             "h2_market_prob": h2_mkt_p,
 
-            # Edges (model minus market), may be null if no market
             "hr_edge": hr_edge,
             "h1_edge": h1_edge,
             "h2_edge": h2_edge,
 
-            # 1.0–10.0 pick scores
             "hr_score": hr_score,
             "h1_score": h1_score,
             "h2_score": h2_score,
         })
 
-
-    return rows
-
+    return JSONResponse(content=rows, headers={"Cache-Control": "no-store"})
