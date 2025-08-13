@@ -426,26 +426,38 @@ async def markets(date: str = Query(default=None)):
 
         rows.append({
             **row,
+
+            # Clear game-level aliases for the frontend (use these in UI)
+            "hr_game_prob": p_hr,
+            "h1_game_prob": p_h1,   # 1+ hit
+            "h2_game_prob": p_h2,   # 2+ hits
+
+            # Fair odds from the model
             "fair_hr_american": fair_hr,
             "fair_h1_american": fair_h1,
             "fair_h2_american": fair_h2,
 
+            # Market odds, if present
             "hr_market_odds": hr_odds if hr_odds is not None else None,
             "h1_market_odds": h1_odds if h1_odds is not None else None,
             "h2_market_odds": h2_odds if h2_odds is not None else None,
 
+            # Market implied probabilities (may be null if no odds returned)
             "hr_market_prob": hr_mkt_p,
             "h1_market_prob": h1_mkt_p,
             "h2_market_prob": h2_mkt_p,
 
+            # Edges (model minus market), may be null if no market
             "hr_edge": hr_edge,
             "h1_edge": h1_edge,
             "h2_edge": h2_edge,
 
+            # 1.0–10.0 pick scores
             "hr_score": hr_score,
             "h1_score": h1_score,
             "h2_score": h2_score,
         })
+
 
     return rows
 
