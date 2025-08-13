@@ -1,7 +1,8 @@
-# main.py — lineups + roster fallback + recent rates + sportsbook odds + edge + baseline-aware scores
+# main.py — lineups + roster fallback + recent rates + sportsbook odds + edge + clamped fair odds + smooth scores
 from __future__ import annotations
 
 import os
+import math
 import asyncio
 import datetime as dt
 from typing import Optional, List, Dict, Any, Tuple
@@ -10,7 +11,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# ---------------- Model feature builder (robust version that uses hr_rate_rolling/hit_rate_rolling) ----------------
+# ---------------- Model feature builder (robust: uses hr_rate_rolling/hit_rate_rolling or fallback) ----------------
 MISSING_MODEL_ARTIFACTS = False
 IMPORT_ERROR_DETAIL = ""
 try:
@@ -57,7 +58,6 @@ async def _get_game_pks_and_teams_for_date(client: httpx.AsyncClient, date_str: 
             for side in ("home", "away"):
                 tinfo = g.get(f"{side}Team", {}) or {}
                 tid = tinfo.get("id")
-                # some schedule payloads nest the name under 'team', others inline
                 tname = (tinfo.get("team", {}) or {}).get("name") or tinfo.get("name") or ""
                 if tid:
                     teams_today.append((int(tid), str(tname)))
@@ -260,19 +260,24 @@ def american_to_prob(odds: Optional[int]) -> Optional[float]:
     return None
 
 def prob_to_american(p: float) -> int:
-    p = max(1e-6, min(0.999999, p))
+    # clamp to avoid crazy odds from near-0/1 probabilities
+    p = max(0.01, min(0.99, float(p)))
     if p >= 0.5:
         return -int(round((p*100) / (1 - p)))
     else:
         return int(round(((1 - p) * 100) / p))
+
+def _looks_like_over(text: str) -> bool:
+    t = text.lower()
+    return t.startswith("over") or " over " in t or t.strip() == "over"
 
 async def fetch_market_odds(date_iso: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """
     Returns {(playerName_lower, market): {'odds': int, 'book': str}}
     Markets we normalize:
       'HR' -> HR Anytime
-      'H1' -> 1+ Hits (To Record a Hit)
-      'H2' -> 2+ Hits
+      'H1' -> 1+ Hits (Over 0.5)
+      'H2' -> 2+ Hits (Over 1.5)
     If no API key or no data, returns {} (app still works).
     """
     if not ODDS_API_KEY:
@@ -309,36 +314,46 @@ async def fetch_market_odds(date_iso: str) -> Dict[Tuple[str, str], Dict[str, An
                 mk_key = (mk.get("key") or "").lower()
                 outcomes = mk.get("outcomes") or []
                 for oc in outcomes:
-                    name = (oc.get("description") or oc.get("name") or "").strip().lower()
+                    name = (oc.get("description") or oc.get("name") or "").strip()
+                    name_l = name.lower()
                     odds = oc.get("price")
                     if odds is None:
                         continue
+
                     # parse player name from outcome text
-                    pl_name = name
-                    for frag in [" to hit a home run", " - hr", " hr", " to record a hit", " over", " under", " hits", " total hits"]:
+                    pl_name = name_l
+                    for frag in [
+                        " to hit a home run", " - hr", " hr",
+                        " to record a hit", " over", " under",
+                        " hits", " total hits"
+                    ]:
                         pl_name = pl_name.replace(frag, "")
                     pl_name = " ".join(pl_name.split()).strip()
                     if not pl_name:
                         continue
 
                     market_norm: Optional[str] = None
-                    if "home run" in name or mk_key == "player_home_run":
+                    if "home run" in name_l or mk_key == "player_home_run":
                         market_norm = "HR"
-                    elif "record a hit" in name:
-                        market_norm = "H1"
-                    elif "2+" in name and "hit" in name:
-                        market_norm = "H2"
                     elif mk_key in ("player_hits_over_under", "player_total_hits"):
-                        ln = oc.get("point")
+                        # we only take OVER outcomes and map by point
+                        point = oc.get("point")
+                        is_over = _looks_like_over(name_l)
+                        if point is None or not is_over:
+                            continue
                         try:
-                            if ln is not None:
-                                ln_f = float(ln)
-                                if 0.5 <= ln_f < 1.5:
-                                    market_norm = "H1"
-                                elif 1.5 <= ln_f < 2.5:
-                                    market_norm = "H2"
+                            pt = float(point)
                         except Exception:
-                            pass
+                            continue
+                        if 0.5 <= pt < 1.5:
+                            market_norm = "H1"   # Over 0.5 hits => 1+ hit
+                        elif 1.5 <= pt < 2.5:
+                            market_norm = "H2"   # Over 1.5 hits => 2+ hits
+                        else:
+                            continue
+                    elif "record a hit" in name_l:
+                        market_norm = "H1"
+
                     if not market_norm:
                         continue
 
@@ -349,18 +364,19 @@ async def fetch_market_odds(date_iso: str) -> Dict[Tuple[str, str], Dict[str, An
 
     return out
 
-# ================= Edge + baseline-aware score =================
+# ================= Edge + smooth baseline-aware score =================
 def score_pick(model_prob: float, market_prob: Optional[float], recent_pa: int, market: str) -> Tuple[Optional[float], float]:
     """
-    Returns (edge, score_1_to_10 in 0.1 steps).
+    Returns (edge, score_1_to_10).
     - With odds: edge = model_prob - market_prob
     - Without odds: edge=None, but score compares model_prob to a baseline for that market.
-    Score scales with recent sample size (last 30d PA) and market weight (HR > H2 > H1).
+    Uses a smooth tanh to avoid everything pegging at 10.
     """
     # Confidence from last-30d PA: saturate ~30 PA, floor 0.2
     conf = min(1.0, max(0.2, recent_pa / 30.0))
-    # Market weights (rarer outcome → higher weight)
-    weight = {"HR": 0.45, "H1": 0.25, "H2": 0.35}.get(market, 0.30)
+
+    # Market weights (rarer outcome → higher impact)
+    weight = {"HR": 1.1, "H2": 0.8, "H1": 0.6}.get(market, 0.7)
 
     if market_prob is None:
         baseline = BASELINE_PROB.get(market, 0.5)
@@ -370,10 +386,15 @@ def score_pick(model_prob: float, market_prob: Optional[float], recent_pa: int, 
         edge = model_prob - market_prob
         eff_edge = edge
 
+    # scale (percentage points) to keep scores in a nice spread
+    # larger S => gentler curve; tuned per market
+    S = {"HR": 6.0, "H2": 10.0, "H1": 14.0}.get(market, 10.0)
     edge_pct = eff_edge * 100.0
-    raw = 5.0 + (edge_pct * weight * conf)
-    score = max(1.0, min(10.0, raw))
-    score = round(score * 10.0) / 10.0
+
+    # Smooth mapping around 5.0 using tanh; multiplied by confidence and market weight
+    delta = math.tanh((edge_pct / S) * weight * conf)  # in [-1, 1]
+    score = 5.0 + 4.5 * delta  # yields [0.5, 9.5] before clamp
+    score = max(1.0, min(10.0, round(score * 10.0) / 10.0))
     return edge, score
 
 # ================= Build payload =================
@@ -423,7 +444,7 @@ async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, 
         return payload
 
     # model predictions (robust builder ensures variation even if schema mismatch)
-    preds = build_today_features(date, players)  # list[dict] with hr_anytime_prob, hits_1plus_prob, hits_2plus_prob
+    preds = build_today_features(date, players)  # list[dict]
 
     # optional sportsbook odds
     odds_map = await fetch_market_odds(date)  # {(playerName_lower, 'HR'): {'odds': -110, 'book': '...'}, ...}
@@ -434,9 +455,10 @@ async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, 
         pid = int(rec["playerId"])
         recent_pa = int(next((p.get("recent_pa", 0) for p in players if int(p["playerId"]) == pid), 0))
 
-        hr_p = float(rec["hr_anytime_prob"])
-        h1_p = float(rec["hits_1plus_prob"])
-        h2_p = float(rec["hits_2plus_prob"])
+        # ensure model probabilities are sane before using them
+        hr_p = max(0.0005, min(0.9995, float(rec["hr_anytime_prob"])))
+        h1_p = max(0.0005, min(0.9995, float(rec["hits_1plus_prob"])))
+        h2_p = max(0.0005, min(0.9995, float(rec["hits_2plus_prob"])))
 
         hr_odds = odds_map.get((name_l, "HR"), {}).get("odds")
         h1_odds = odds_map.get((name_l, "H1"), {}).get("odds")
@@ -462,7 +484,7 @@ async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, 
             "hits_1plus_prob": round(h1_p, 4),
             "hits_2plus_prob": round(h2_p, 4),
 
-            # model-implied fair odds
+            # model-implied fair odds (clamped)
             "fair_hr_american": prob_to_american(hr_p),
             "fair_h1_american": prob_to_american(h1_p),
             "fair_h2_american": prob_to_american(h2_p),
@@ -475,7 +497,7 @@ async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, 
             "h1_market_prob": None if h1_mp is None else round(h1_mp, 4),
             "h2_market_prob": None if h2_mp is None else round(h2_mp, 4),
 
-            # edge & score (score works even without odds thanks to baselines)
+            # edge & score
             "hr_edge": None if hr_edge is None else round(hr_edge, 4),
             "h1_edge": None if h1_edge is None else round(h1_edge, 4),
             "h2_edge": None if h2_edge is None else round(h2_edge, 4),
@@ -485,7 +507,6 @@ async def compute_markets_payload(date: Optional[str] = None) -> List[Dict[str, 
 
             # extras for UI / QA
             "recent_pa": recent_pa,
-            # if your robust feature_builder includes these, they’ll pass through; otherwise ignore
             "hr_prob_pa_model": rec.get("hr_prob_pa_model"),
             "hit_prob_pa_model": rec.get("hit_prob_pa_model"),
             "hr_rate_rolling": rec.get("hr_rate_rolling"),
