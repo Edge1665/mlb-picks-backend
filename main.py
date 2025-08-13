@@ -32,6 +32,12 @@ app.add_middleware(
 )
 
 # ========= Helpers: MLB schedule/lineups (no roster fallback) =========
+# --- MLB StatsAPI lineup fetch (with roster fallback) ---
+# Endpoints:
+#   Schedule:  https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=YYYY-MM-DD
+#   Boxscore:  https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore
+#   Roster:    https://statsapi.mlb.com/api/v1/teams/{teamId}/roster?rosterType=active
+
 async def _get_game_pks_for_date(client: httpx.AsyncClient, date_str: str) -> List[int]:
     url = "https://statsapi.mlb.com/api/v1/schedule"
     params = {"sportId": 1, "date": date_str}
@@ -70,52 +76,96 @@ def _extract_lineup_from_boxscore_json(js: Dict[str, Any]) -> List[Dict[str, Any
                 "playerId": int(pid),
                 "playerName": str(name),
                 "team": team_name,
-                "lineupSpot": lineup_spot,
+                "lineupSpot": lineup_spot
             })
-    # dedupe by playerId
-    seen = set()
-    dedup: List[Dict[str, Any]] = []
+    # dedupe
+    seen = set(); dedup: List[Dict[str, Any]] = []
     for r in out:
-        if r["playerId"] in seen:
-            continue
-        seen.add(r["playerId"])
-        dedup.append(r)
+        if r["playerId"] in seen: continue
+        seen.add(r["playerId"]); dedup.append(r)
     return dedup
 
-async def _fetch_boxscore_lineups(client: httpx.AsyncClient, game_pk: int) -> List[Dict[str, Any]]:
-    url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+def _teams_from_boxscore(js: Dict[str, Any]) -> List[Dict[str, Any]]:
+    teams: List[Dict[str, Any]] = []
+    for side in ("home", "away"):
+        blk = js.get("teams", {}).get(side, {}) or {}
+        team = blk.get("team", {}) or {}
+        tid = team.get("id"); tname = team.get("name")
+        if tid and tname:
+            teams.append({"teamId": int(tid), "teamName": str(tname)})
+    return teams
+
+async def _fetch_active_roster(client: httpx.AsyncClient, team_id: int, team_name: str) -> List[Dict[str, Any]]:
+    url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster"
+    params = {"rosterType": "active"}
+    r = await client.get(url, params=params, timeout=20)
+    if r.status_code != 200:
+        return []
+    out: List[Dict[str, Any]] = []
     try:
-        r = await client.get(url, timeout=20)
-        if r.status_code != 200:
-            return []
-        return _extract_lineup_from_boxscore_json(r.json())
+        data = r.json()
+        for item in data.get("roster", []) or []:
+            person = item.get("person", {}) or {}
+            pid = person.get("id"); name = person.get("fullName") or "Unknown"
+            if not pid: continue
+            out.append({
+                "playerId": int(pid),
+                "playerName": str(name),
+                "team": team_name,
+                "lineupSpot": None  # unknown before lineups
+            })
     except Exception:
         return []
+    return out
+
+async def _fetch_boxscore_with_fallback(client: httpx.AsyncClient, game_pk: int) -> List[Dict[str, Any]]:
+    # Try posted lineups
+    url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+    r = await client.get(url, timeout=20)
+    if r.status_code != 200:
+        return []
+    try:
+        js = r.json()
+    except Exception:
+        return []
+
+    lineup = _extract_lineup_from_boxscore_json(js)
+    if lineup:
+        return lineup
+
+    # Fallback to active rosters (before lineups post)
+    teams = _teams_from_boxscore(js)
+    if not teams:
+        return []
+    res = await asyncio.gather(*(asyncio.create_task(_fetch_active_roster(client, t["teamId"], t["teamName"])) for t in teams), return_exceptions=True)
+    players: List[Dict[str, Any]] = []
+    for r in res:
+        if isinstance(r, Exception): continue
+        players.extend(r)
+
+    # dedupe
+    seen = set(); dedup: List[Dict[str, Any]] = []
+    for r in players:
+        if r["playerId"] in seen: continue
+        seen.add(r["playerId"]); dedup.append(r)
+    return dedup
 
 async def fetch_lineups_for_today(date_str: Optional[str] = None) -> List[Dict[str, Any]]:
     if not date_str:
         date_str = dt.date.today().isoformat()
     async with httpx.AsyncClient() as client:
-        game_pks = await _get_game_pks_for_date(client, date_str)
-        if not game_pks:
-            return []
-        results = await asyncio.gather(
-            *(asyncio.create_task(_fetch_boxscore_lineups(client, pk)) for pk in game_pks),
-            return_exceptions=True
-        )
+        pks = await _get_game_pks_for_date(client, date_str)
+        if not pks: return []
+        res = await asyncio.gather(*(asyncio.create_task(_fetch_boxscore_with_fallback(client, pk)) for pk in pks), return_exceptions=True)
     players: List[Dict[str, Any]] = []
-    for res in results:
-        if isinstance(res, Exception):
-            continue
-        players.extend(res)
+    for r in res:
+        if isinstance(r, Exception): continue
+        players.extend(r)
     # final dedupe
-    seen = set()
-    dedup: List[Dict[str, Any]] = []
+    seen = set(); dedup: List[Dict[str, Any]] = []
     for r in players:
-        if r["playerId"] in seen:
-            continue
-        seen.add(r["playerId"])
-        dedup.append(r)
+        if r["playerId"] in seen: continue
+        seen.add(r["playerId"]); dedup.append(r)
     return dedup
 
 # ========= Helpers: last-30-day hitting rates (per player) =========
